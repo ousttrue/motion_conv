@@ -1,9 +1,25 @@
+"""
+dependencies:
+
+- https://github.com/20tab/bvh-python
+```
+$ pip install bvh
+```
+
+- https://github.com/Zuzu-Typ/PyGLM
+```
+$ pip install pyglm
+```
+"""
 from __future__ import annotations
 from typing import List, TypedDict, Tuple, Optional, Dict
 from typing_extensions import NotRequired
 import argparse
 import pathlib
 import bvh
+import ctypes
+import base64
+
 import glm
 import json
 from enum import Enum, auto
@@ -98,6 +114,49 @@ class GltfNode(TypedDict):
     children: NotRequired[List[int]]
 
 
+class GltfBuffer(TypedDict):
+    uri: str
+    byteLength: int
+
+
+class GltfBufferView(TypedDict):
+    buffer: int
+    byteOffset: int
+    byteLength: int
+    target: NotRequired[int]
+
+
+class GltfAccessor(TypedDict):
+    bufferView: int
+    byteOffset: NotRequired[int]
+    componentType: int
+    count: int
+    type: str
+    max: NotRequired[List[float]]
+    min: NotRequired[List[float]]
+
+
+class GltfAnimationSampler(TypedDict):
+    input: int
+    interpolation: str
+    output: int
+
+
+class GltfAnimationTarget(TypedDict):
+    node: int
+    path: str
+
+
+class GltfAnimationChannel(TypedDict):
+    sampler: int
+    target: GltfAnimationTarget
+
+
+class GltfAnimation(TypedDict):
+    samplers: List[GltfAnimationSampler]
+    channels: List[GltfAnimationChannel]
+
+
 class VrmAnimationHumanoidBone(TypedDict):
     node: int
 
@@ -157,24 +216,29 @@ class VrmAnimationHumanoidBones(TypedDict):
     # leftLittleProximal: VrmAnimationHumanoidBone
 
 
-class VrmAnimationHumanoid(TypedDict):
-    humanBones: object
+# class VrmAnimationHumanoid(TypedDict):
+#     humanBones: object
 
 
 class VrmAnimation(TypedDict):
     specVersion: str
-    humanoid: VrmAnimationHumanoid
+    humanoid: VrmAnimationHumanoidBones
 
 
 class GltfExtensions(TypedDict):
-    VRMC_vrm_animation: VrmAnimation
+    VRMC_vrm_animation: NotRequired[VrmAnimation]
 
 
 class Gltf(TypedDict):
     asset: GltfAsset
+    buffers: List[GltfBuffer]
+    bufferViews: List[GltfBufferView]
+    accessors: List[GltfAccessor]
+    #
     scene: int
     scenes: List[GltfScene]
     nodes: List[GltfNode]
+    animations: List[GltfAnimation]
     #
     extensionsUsed: NotRequired[List[str]]
     extensions: NotRequired[GltfExtensions]
@@ -194,13 +258,20 @@ def print_gltf(nodes, node_index, indent=""):
 
 
 def build_hierarchy(
-    gltf_nodes: List[GltfNode], gltf_parent: GltfNode, bvh_node: bvh.BvhNode
+    gltf_nodes: List[GltfNode],
+    gltf_parent: GltfNode,
+    bvh_node: bvh.BvhNode,
+    scale: float,
 ):
     offset = bvh_node["OFFSET"]
-    assert(offset)
+    assert offset
     gltf_node: GltfNode = {
         "name": bvh_node.name,
-        "translation": (float(offset[0]), float(offset[1]), float(offset[2])),
+        "translation": (
+            float(offset[0]) * scale,
+            float(offset[1]) * scale,
+            float(offset[2]) * scale,
+        ),
     }
     gltf_child_index = len(gltf_nodes)
     if "children" not in gltf_parent:
@@ -209,9 +280,9 @@ def build_hierarchy(
     gltf_parent["children"].append(gltf_child_index)
 
     for child in bvh_node.filter("JOINT"):
-        build_hierarchy(gltf_nodes, gltf_node, child)
+        build_hierarchy(gltf_nodes, gltf_node, child, scale)
     for child in bvh_node.filter("End"):
-        build_hierarchy(gltf_nodes, gltf_node, child)
+        build_hierarchy(gltf_nodes, gltf_node, child, scale)
 
 
 class GetBB:
@@ -246,7 +317,93 @@ hips: {self.world_pos[hips_index]}
             self.traverse(pos, child_index, indent + "  ")
 
 
-def convert(src: pathlib.Path, dst: pathlib.Path):
+class BinWriter:
+    def __init__(self) -> None:
+        self.bytes = bytearray()
+        self.views: List[GltfBufferView] = []
+        self.accessors: List[GltfAccessor] = []
+
+    def push_float_array(self, value_elements: int, data: bytes) -> int:
+        offset = len(self.bytes)
+        self.bytes += data
+        view_index = len(self.views)
+        self.views.append(
+            {
+                "buffer": 0,
+                "byteOffset": offset,
+                "byteLength": len(data),
+            }
+        )
+        accessor_index = len(self.accessors)
+        value_type = ""
+        count: int = 0
+        match (value_elements):
+            case 1:
+                value_type = "SCALAR"
+                count = len(data) // 4
+            case 3:
+                value_type = "VEC3"
+                count = len(data) // 12
+            case 4:
+                value_type = "VEC4"
+                count = len(data) // 16
+            case _:
+                raise Exception()
+        self.accessors.append(
+            {
+                "bufferView": view_index,
+                "componentType": 5126,  # float
+                "type": value_type,
+                "count": count,
+            }
+        )
+        return accessor_index
+
+    def to_base64(self) -> GltfBuffer:
+        encoded = base64.b64encode(self.bytes)
+        debug = base64.b64decode(encoded)
+        assert debug == self.bytes
+        return {
+            "uri": (b"data:application/octet-stream;base64," + encoded).decode("ascii"),
+            "byteLength": len(self.bytes),
+        }
+
+
+def bvh_animation(mocap: bvh.Bvh, bin: BinWriter, scale: float) -> GltfAnimation:
+    input = (ctypes.c_float * mocap.nframes)()
+    for i in range(mocap.nframes):
+        input[i] = i * mocap.frame_time
+    output = (ctypes.c_float * (mocap.nframes * 3))()
+    for i, f in enumerate(mocap.frames):
+        output[i * 3] = float(f[0]) * scale
+        output[i * 3 + 1] = float(f[1]) * scale
+        output[i * 3 + 2] = float(f[2]) * scale
+    sampler: GltfAnimationSampler = {
+        "input": bin.push_float_array(1, memoryview(input).tobytes()),
+        "interpolation": "LINEAR",
+        "output": bin.push_float_array(3, memoryview(output).tobytes()),
+    }
+    channel: GltfAnimationChannel = {
+        "sampler": 0,
+        "target": {
+            "node": 1,
+            "path": "translation",
+        },
+    }
+    animation: GltfAnimation = {
+        "samplers": [sampler],
+        "channels": [channel],
+    }
+    return animation
+
+
+def convert(src: pathlib.Path, dst: pathlib.Path, scale: float):
+    # load bvh
+    mocap = bvh.Bvh(src.read_text())
+    bvh_root = next(mocap.root.filter("ROOT"))
+    # print_bvh(bvh_root)
+
+    # gltf
     root: GltfNode = {
         "name": "__ROOT__",
         "translation": (0, 0, 0),
@@ -254,54 +411,62 @@ def convert(src: pathlib.Path, dst: pathlib.Path):
     nodes: List[GltfNode] = [root]
     gltf: Gltf = {
         "asset": {"version": "2.0"},
+        "extensionsUsed": [],
+        "extensions": {},
+        "accessors": [],
         "scene": 0,
         "scenes": [{"nodes": [0]}],
         "nodes": nodes,
+        "animations": [],
+        "buffers": [],
+        "bufferViews": [],
     }
-
-    mocap = bvh.Bvh(src.read_text())
-    bvh_root = next(mocap.root.filter("ROOT"))
-    build_hierarchy(nodes, root, bvh_root)
-    # print_bvh(bvh_root)
+    build_hierarchy(nodes, root, bvh_root, scale)
     print_gltf(gltf["nodes"], 0)
 
+    # animation
+    bin = BinWriter()
+    animation = bvh_animation(mocap, bin, scale)
+    gltf["animations"].append(animation)
+    gltf["buffers"].append(bin.to_base64())
+    gltf["bufferViews"] += bin.views
+    gltf["accessors"] += bin.accessors
+
+    # humanoid
     map = {}
     for i, node in enumerate(gltf["nodes"]):
         bone = guess_humanoid(node["name"])
         if bone:
             map[bone] = i
             print(f'{node["name"]} => {bone}')
-
-    gltf["extensionsUsed"] = ["VRMC_vrm_animation"]
-    gltf["extensions"] = {
-        "VRMC_vrm_animation": {
-            "specVersion": "1.0-draft",
-            "humanoid": {
-                "humanBones": {
-                    "hips": map[HumanBones.Hips],
-                    "spine": map[HumanBones.Spine],
-                    "chest": map[HumanBones.Chest],
-                    "neck": map[HumanBones.Neck],
-                    "head": map[HumanBones.Head],
-                    "leftShoulder": map[HumanBones.LeftShoulder],
-                    "leftUpperArm": map[HumanBones.LeftUpperArm],
-                    "leftLowerArm": map[HumanBones.LeftLowerArm],
-                    "leftHand": map[HumanBones.LeftHand],
-                    "rightShoulder": map[HumanBones.RightShoulder],
-                    "rightUpperArm": map[HumanBones.RightUpperArm],
-                    "rightLowerArm": map[HumanBones.RightLowerArm],
-                    "rightHand": map[HumanBones.RightHand],
-                    "leftUpperLeg": map[HumanBones.LeftUpperLeg],
-                    "leftLowerLeg": map[HumanBones.LeftLowerLeg],
-                    "leftFoot": map[HumanBones.LeftFoot],
-                    "leftToes": map[HumanBones.LeftToes],
-                    "rightUpperLeg": map[HumanBones.RightUpperLeg],
-                    "rightLowerLeg": map[HumanBones.RightLowerLeg],
-                    "rightFoot": map[HumanBones.RightFoot],
-                    "rightToes": map[HumanBones.RightToes],
-                }
-            },
-        }
+    gltf["extensionsUsed"].append("VRMC_vrm_animation")
+    gltf["extensions"]["VRMC_vrm_animation"] = {
+        "specVersion": "1.0-draft",
+        "humanoid": {
+            # "humanBones": {
+            "hips": {"node": map[HumanBones.Hips]},
+            "spine": {"node": map[HumanBones.Spine]},
+            "chest": {"node": map[HumanBones.Chest]},
+            "neck": {"node": map[HumanBones.Neck]},
+            "head": {"node": map[HumanBones.Head]},
+            "leftShoulder": {"node": map[HumanBones.LeftShoulder]},
+            "leftUpperArm": {"node": map[HumanBones.LeftUpperArm]},
+            "leftLowerArm": {"node": map[HumanBones.LeftLowerArm]},
+            "leftHand": {"node": map[HumanBones.LeftHand]},
+            "rightShoulder": {"node": map[HumanBones.RightShoulder]},
+            "rightUpperArm": {"node": map[HumanBones.RightUpperArm]},
+            "rightLowerArm": {"node": map[HumanBones.RightLowerArm]},
+            "rightHand": {"node": map[HumanBones.RightHand]},
+            "leftUpperLeg": {"node": map[HumanBones.LeftUpperLeg]},
+            "leftLowerLeg": {"node": map[HumanBones.LeftLowerLeg]},
+            "leftFoot": {"node": map[HumanBones.LeftFoot]},
+            "leftToes": {"node": map[HumanBones.LeftToes]},
+            "rightUpperLeg": {"node": map[HumanBones.RightUpperLeg]},
+            "rightLowerLeg": {"node": map[HumanBones.RightLowerLeg]},
+            "rightFoot": {"node": map[HumanBones.RightFoot]},
+            "rightToes": {"node": map[HumanBones.RightToes]},
+            # }
+        },
     }
 
     bb = GetBB(gltf)
@@ -315,8 +480,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("bvh", help="src bvh path", type=pathlib.Path)
     parser.add_argument("vrm", help="dst vrm path", type=pathlib.Path)
+    parser.add_argument("--scale", help="scaling factor", type=float, default=1.0)
     args = parser.parse_args()
-    convert(args.bvh, args.vrm)
+    convert(args.bvh, args.vrm, args.scale)
 
 
 if __name__ == "__main__":
