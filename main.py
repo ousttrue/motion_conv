@@ -258,6 +258,7 @@ def print_gltf(nodes, node_index, indent=""):
 
 
 class BvhChannelInfo(NamedTuple):
+    gltf_node_index: int
     channels: List[str]
 
 
@@ -272,6 +273,7 @@ class BvhBuilder:
         bvh_node: bvh.BvhNode,
         scale: float,
     ):
+        gltf_node_index = len(self.gltf_nodes)
         offset = bvh_node["OFFSET"]
         assert offset
         gltf_node: GltfNode = {
@@ -289,7 +291,9 @@ class BvhBuilder:
         gltf_parent["children"].append(gltf_child_index)
 
         for channels in bvh_node.filter("CHANNELS"):
-            self.bvh_channels.append(BvhChannelInfo(channels.value[2:]))
+            self.bvh_channels.append(
+                BvhChannelInfo(gltf_node_index, channels.value[2:])
+            )
 
         for child in bvh_node.filter("JOINT"):
             self.build_hierarchy(gltf_node, child, scale)
@@ -407,44 +411,96 @@ class BvhAnimation:
                     "Xrotation",
                     "Yrotation",
                 ]:
-                    self.translation(mocap, input, offset, offset + 1, offset + 2)
-                    self.rotation_zxy(mocap, input, offset + 3, offset + 4, offset + 5)
+                    self.translation(
+                        mocap,
+                        input,
+                        node_channel.gltf_node_index,
+                        offset,
+                        offset + 1,
+                        offset + 2,
+                    )
+                    self.rotation_zxy(
+                        mocap,
+                        input,
+                        node_channel.gltf_node_index,
+                        offset + 3,
+                        offset + 4,
+                        offset + 5,
+                    )
 
                 case [
                     "Zrotation",
                     "Xrotation",
                     "Yrotation",
                 ]:
-                    self.rotation_zxy(mocap, input, offset + 3, offset + 4, offset + 5)
+                    self.rotation_zxy(
+                        mocap,
+                        input,
+                        node_channel.gltf_node_index,
+                        offset,
+                        offset + 1,
+                        offset + 2,
+                    )
 
                 case _:
                     raise NotImplemented()
 
             offset += len(node_channel.channels)
 
-    def translation(self, mocap: bvh.Bvh, input, x: int, y: int, z: int):
+    def translation(
+        self, mocap: bvh.Bvh, input, node_index: int, x: int, y: int, z: int
+    ):
         output = (ctypes.c_float * (mocap.nframes * 3))()
         for i, f in enumerate(mocap.frames):
-            output[i * 3 + x] = float(f[0]) * self.scale
-            output[i * 3 + y] = float(f[1]) * self.scale
-            output[i * 3 + z] = float(f[2]) * self.scale
+            output[i * 3 + 0] = float(f[x]) * self.scale
+            output[i * 3 + 1] = float(f[y]) * self.scale
+            output[i * 3 + 2] = float(f[z]) * self.scale
         gltf_sampler: GltfAnimationSampler = {
             "input": self.bin.push_float_array(1, memoryview(input).tobytes()),
             "interpolation": "LINEAR",
             "output": self.bin.push_float_array(3, memoryview(output).tobytes()),
         }
+        sampler_index = len(self.gltf_animation["samplers"])
+        self.gltf_animation["samplers"].append(gltf_sampler)
         gltf_channel: GltfAnimationChannel = {
-            "sampler": 0,
+            "sampler": sampler_index,
             "target": {
-                "node": 1,
+                "node": node_index,
                 "path": "translation",
             },
         }
-        self.gltf_animation["samplers"].append(gltf_sampler)
         self.gltf_animation["channels"].append(gltf_channel)
 
-    def rotation_zxy(self, mocap: bvh.Bvh, input, z: int, x: int, y: int):
-        pass
+    def rotation_zxy(
+        self, mocap: bvh.Bvh, input, node_index: int, z: int, x: int, y: int
+    ):
+        output = (ctypes.c_float * (mocap.nframes * 4))()
+        for i, f in enumerate(mocap.frames):
+            # TODO: euler
+            rz = glm.quat(glm.radians(glm.vec3(0, 0, float(f[z]))))
+            rx = glm.quat(glm.radians(glm.vec3(float(f[x]), 0, 0)))
+            ry = glm.quat(glm.radians(glm.vec3(0, float(f[y]), 0)))
+            q = rz * rx * ry
+            # q = ry * rx * rz
+            output[i * 4 + 0] = q.x
+            output[i * 4 + 1] = q.y
+            output[i * 4 + 2] = q.z
+            output[i * 4 + 3] = q.w
+        gltf_sampler: GltfAnimationSampler = {
+            "input": self.bin.push_float_array(1, memoryview(input).tobytes()),
+            "interpolation": "LINEAR",
+            "output": self.bin.push_float_array(4, memoryview(output).tobytes()),
+        }
+        sampler_index = len(self.gltf_animation["samplers"])
+        self.gltf_animation["samplers"].append(gltf_sampler)
+        gltf_channel: GltfAnimationChannel = {
+            "sampler": sampler_index,
+            "target": {
+                "node": node_index,
+                "path": "rotation",
+            },
+        }
+        self.gltf_animation["channels"].append(gltf_channel)
 
 
 def convert(src: pathlib.Path, dst: pathlib.Path, scale: float):
