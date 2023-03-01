@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, TypedDict, Tuple, Optional
+from typing import List, TypedDict, Tuple, Optional, Dict
 from typing_extensions import NotRequired
 import argparse
 import pathlib
@@ -98,11 +98,86 @@ class GltfNode(TypedDict):
     children: NotRequired[List[int]]
 
 
+class VrmAnimationHumanoidBone(TypedDict):
+    node: int
+
+
+class VrmAnimationHumanoidBones(TypedDict):
+    hips: VrmAnimationHumanoidBone
+    spine: VrmAnimationHumanoidBone
+    chest: VrmAnimationHumanoidBone
+    # upperChest: VrmAnimationHumanoidBone
+    neck: VrmAnimationHumanoidBone
+    head: VrmAnimationHumanoidBone
+    leftShoulder: VrmAnimationHumanoidBone
+    leftUpperArm: VrmAnimationHumanoidBone
+    leftLowerArm: VrmAnimationHumanoidBone
+    leftHand: VrmAnimationHumanoidBone
+    rightShoulder: VrmAnimationHumanoidBone
+    rightUpperArm: VrmAnimationHumanoidBone
+    rightLowerArm: VrmAnimationHumanoidBone
+    rightHand: VrmAnimationHumanoidBone
+    leftUpperLeg: VrmAnimationHumanoidBone
+    leftLowerLeg: VrmAnimationHumanoidBone
+    leftFoot: VrmAnimationHumanoidBone
+    leftToes: VrmAnimationHumanoidBone
+    rightUpperLeg: VrmAnimationHumanoidBone
+    rightLowerLeg: VrmAnimationHumanoidBone
+    rightFoot: VrmAnimationHumanoidBone
+    rightToes: VrmAnimationHumanoidBone
+    # rightThumbDistal: VrmAnimationHumanoidBone
+    # rightThumbProximal: VrmAnimationHumanoidBone
+    # rightThumbMetacarpal: VrmAnimationHumanoidBone
+    # rightIndexDistal: VrmAnimationHumanoidBone
+    # rightIndexIntermediate: VrmAnimationHumanoidBone
+    # rightIndexProximal: VrmAnimationHumanoidBone
+    # rightMiddleDistal: VrmAnimationHumanoidBone
+    # rightMiddleIntermediate: VrmAnimationHumanoidBone
+    # rightMiddleProximal: VrmAnimationHumanoidBone
+    # rightRingDistal: VrmAnimationHumanoidBone
+    # rightRingIntermediate: VrmAnimationHumanoidBone
+    # rightRingProximal: VrmAnimationHumanoidBone
+    # rightLittleDistal: VrmAnimationHumanoidBone
+    # rightLittleIntermediate: VrmAnimationHumanoidBone
+    # rightLittleProximal: VrmAnimationHumanoidBone
+    # leftThumbDistal: VrmAnimationHumanoidBone
+    # leftThumbProximal: VrmAnimationHumanoidBone
+    # leftThumbMetacarpal: VrmAnimationHumanoidBone
+    # leftIndexDistal: VrmAnimationHumanoidBone
+    # leftIndexIntermediate: VrmAnimationHumanoidBone
+    # leftIndexProximal: VrmAnimationHumanoidBone
+    # leftMiddleDistal: VrmAnimationHumanoidBone
+    # leftMiddleIntermediate: VrmAnimationHumanoidBone
+    # leftMiddleProximal: VrmAnimationHumanoidBone
+    # leftRingDistal: VrmAnimationHumanoidBone
+    # leftRingIntermediate: VrmAnimationHumanoidBone
+    # leftRingProximal: VrmAnimationHumanoidBone
+    # leftLittleDistal: VrmAnimationHumanoidBone
+    # leftLittleIntermediate: VrmAnimationHumanoidBone
+    # leftLittleProximal: VrmAnimationHumanoidBone
+
+
+class VrmAnimationHumanoid(TypedDict):
+    humanBones: object
+
+
+class VrmAnimation(TypedDict):
+    specVersion: str
+    humanoid: VrmAnimationHumanoid
+
+
+class GltfExtensions(TypedDict):
+    VRMC_vrm_animation: VrmAnimation
+
+
 class Gltf(TypedDict):
     asset: GltfAsset
     scene: int
     scenes: List[GltfScene]
     nodes: List[GltfNode]
+    #
+    extensionsUsed: NotRequired[List[str]]
+    extensions: NotRequired[GltfExtensions]
 
 
 def print_bvh(node, indent=""):
@@ -122,6 +197,7 @@ def build_hierarchy(
     gltf_nodes: List[GltfNode], gltf_parent: GltfNode, bvh_node: bvh.BvhNode
 ):
     offset = bvh_node["OFFSET"]
+    assert(offset)
     gltf_node: GltfNode = {
         "name": bvh_node.name,
         "translation": (float(offset[0]), float(offset[1]), float(offset[2])),
@@ -134,6 +210,8 @@ def build_hierarchy(
 
     for child in bvh_node.filter("JOINT"):
         build_hierarchy(gltf_nodes, gltf_node, child)
+    for child in bvh_node.filter("End"):
+        build_hierarchy(gltf_nodes, gltf_node, child)
 
 
 class GetBB:
@@ -141,11 +219,22 @@ class GetBB:
         self.gltf = gltf
         self.min = glm.vec3(float("inf"), float("inf"), float("inf"))
         self.max = glm.vec3(-float("inf"), -float("inf"), -float("inf"))
+        self.world_pos: Dict[int, glm.vec3] = {}
+
+    def print(self, hips_index: int):
+        print(
+            f"""min: {self.min}
+max: {self.max}
+size: {self.max-self.min}
+hips: {self.world_pos[hips_index]}
+"""
+        )
 
     def traverse(self, parent=glm.vec3(0, 0, 0), node_index=0, indent=""):
         node = self.gltf["nodes"][node_index]
         offset = node["translation"]
         pos = parent + glm.vec3(offset[0], offset[1], offset[2])
+        self.world_pos[node_index] = pos
         self.min = glm.vec3(
             min(self.min.x, pos.x), min(self.min.y, pos.y), min(self.min.z, pos.z)
         )
@@ -175,17 +264,51 @@ def convert(src: pathlib.Path, dst: pathlib.Path):
     build_hierarchy(nodes, root, bvh_root)
     # print_bvh(bvh_root)
     print_gltf(gltf["nodes"], 0)
-    bb = GetBB(gltf)
-    bb.traverse()
-    print(bb.min, bb.max)
-    # get_bb(gltf)
-    dst.write_text(json.dumps(gltf), encoding="utf-8")
 
     map = {}
-    for node in gltf["nodes"][1:]:
+    for i, node in enumerate(gltf["nodes"]):
         bone = guess_humanoid(node["name"])
         if bone:
+            map[bone] = i
             print(f'{node["name"]} => {bone}')
+
+    gltf["extensionsUsed"] = ["VRMC_vrm_animation"]
+    gltf["extensions"] = {
+        "VRMC_vrm_animation": {
+            "specVersion": "1.0-draft",
+            "humanoid": {
+                "humanBones": {
+                    "hips": map[HumanBones.Hips],
+                    "spine": map[HumanBones.Spine],
+                    "chest": map[HumanBones.Chest],
+                    "neck": map[HumanBones.Neck],
+                    "head": map[HumanBones.Head],
+                    "leftShoulder": map[HumanBones.LeftShoulder],
+                    "leftUpperArm": map[HumanBones.LeftUpperArm],
+                    "leftLowerArm": map[HumanBones.LeftLowerArm],
+                    "leftHand": map[HumanBones.LeftHand],
+                    "rightShoulder": map[HumanBones.RightShoulder],
+                    "rightUpperArm": map[HumanBones.RightUpperArm],
+                    "rightLowerArm": map[HumanBones.RightLowerArm],
+                    "rightHand": map[HumanBones.RightHand],
+                    "leftUpperLeg": map[HumanBones.LeftUpperLeg],
+                    "leftLowerLeg": map[HumanBones.LeftLowerLeg],
+                    "leftFoot": map[HumanBones.LeftFoot],
+                    "leftToes": map[HumanBones.LeftToes],
+                    "rightUpperLeg": map[HumanBones.RightUpperLeg],
+                    "rightLowerLeg": map[HumanBones.RightLowerLeg],
+                    "rightFoot": map[HumanBones.RightFoot],
+                    "rightToes": map[HumanBones.RightToes],
+                }
+            },
+        }
+    }
+
+    bb = GetBB(gltf)
+    bb.traverse()
+    bb.print(map[HumanBones.Hips])
+    # get_bb(gltf)
+    dst.write_text(json.dumps(gltf), encoding="utf-8")
 
 
 def main():
