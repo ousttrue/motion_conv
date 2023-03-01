@@ -12,7 +12,7 @@ $ pip install pyglm
 ```
 """
 from __future__ import annotations
-from typing import List, TypedDict, Tuple, Optional, Dict
+from typing import List, TypedDict, Tuple, Optional, Dict, NamedTuple
 from typing_extensions import NotRequired
 import argparse
 import pathlib
@@ -257,32 +257,44 @@ def print_gltf(nodes, node_index, indent=""):
         print_gltf(nodes, child_index, indent + "  ")
 
 
-def build_hierarchy(
-    gltf_nodes: List[GltfNode],
-    gltf_parent: GltfNode,
-    bvh_node: bvh.BvhNode,
-    scale: float,
-):
-    offset = bvh_node["OFFSET"]
-    assert offset
-    gltf_node: GltfNode = {
-        "name": bvh_node.name,
-        "translation": (
-            float(offset[0]) * scale,
-            float(offset[1]) * scale,
-            float(offset[2]) * scale,
-        ),
-    }
-    gltf_child_index = len(gltf_nodes)
-    if "children" not in gltf_parent:
-        gltf_parent["children"] = []
-    gltf_nodes.append(gltf_node)
-    gltf_parent["children"].append(gltf_child_index)
+class BvhChannelInfo(NamedTuple):
+    channels: List[str]
 
-    for child in bvh_node.filter("JOINT"):
-        build_hierarchy(gltf_nodes, gltf_node, child, scale)
-    for child in bvh_node.filter("End"):
-        build_hierarchy(gltf_nodes, gltf_node, child, scale)
+
+class BvhBuilder:
+    def __init__(self, gltf_nodes: List[GltfNode]) -> None:
+        self.gltf_nodes = gltf_nodes
+        self.bvh_channels: List[BvhChannelInfo] = []
+
+    def build_hierarchy(
+        self,
+        gltf_parent: GltfNode,
+        bvh_node: bvh.BvhNode,
+        scale: float,
+    ):
+        offset = bvh_node["OFFSET"]
+        assert offset
+        gltf_node: GltfNode = {
+            "name": bvh_node.name,
+            "translation": (
+                float(offset[0]) * scale,
+                float(offset[1]) * scale,
+                float(offset[2]) * scale,
+            ),
+        }
+        gltf_child_index = len(self.gltf_nodes)
+        if "children" not in gltf_parent:
+            gltf_parent["children"] = []
+        self.gltf_nodes.append(gltf_node)
+        gltf_parent["children"].append(gltf_child_index)
+
+        for channels in bvh_node.filter("CHANNELS"):
+            self.bvh_channels.append(BvhChannelInfo(channels.value[2:]))
+
+        for child in bvh_node.filter("JOINT"):
+            self.build_hierarchy(gltf_node, child, scale)
+        for child in bvh_node.filter("End"):
+            self.build_hierarchy(gltf_node, child, scale)
 
 
 class GetBB:
@@ -369,32 +381,70 @@ class BinWriter:
         }
 
 
-def bvh_animation(mocap: bvh.Bvh, bin: BinWriter, scale: float) -> GltfAnimation:
-    input = (ctypes.c_float * mocap.nframes)()
-    for i in range(mocap.nframes):
-        input[i] = i * mocap.frame_time
-    output = (ctypes.c_float * (mocap.nframes * 3))()
-    for i, f in enumerate(mocap.frames):
-        output[i * 3] = float(f[0]) * scale
-        output[i * 3 + 1] = float(f[1]) * scale
-        output[i * 3 + 2] = float(f[2]) * scale
-    sampler: GltfAnimationSampler = {
-        "input": bin.push_float_array(1, memoryview(input).tobytes()),
-        "interpolation": "LINEAR",
-        "output": bin.push_float_array(3, memoryview(output).tobytes()),
-    }
-    channel: GltfAnimationChannel = {
-        "sampler": 0,
-        "target": {
-            "node": 1,
-            "path": "translation",
-        },
-    }
-    animation: GltfAnimation = {
-        "samplers": [sampler],
-        "channels": [channel],
-    }
-    return animation
+class BvhAnimation:
+    def __init__(self, bin: BinWriter, scale: float) -> None:
+        self.bin = bin
+        self.scale = scale
+        self.gltf_animation: GltfAnimation = {
+            "samplers": [],
+            "channels": [],
+        }
+
+    def bvh_animation(self, mocap: bvh.Bvh, channels: List[BvhChannelInfo]):
+        input = (ctypes.c_float * mocap.nframes)()
+        for i in range(mocap.nframes):
+            input[i] = i * mocap.frame_time
+
+        offset = 0
+        for node_channel in channels:
+
+            match node_channel.channels:
+                case [
+                    "Xposition",
+                    "Yposition",
+                    "Zposition",
+                    "Zrotation",
+                    "Xrotation",
+                    "Yrotation",
+                ]:
+                    self.translation(mocap, input, offset, offset + 1, offset + 2)
+                    self.rotation_zxy(mocap, input, offset + 3, offset + 4, offset + 5)
+
+                case [
+                    "Zrotation",
+                    "Xrotation",
+                    "Yrotation",
+                ]:
+                    self.rotation_zxy(mocap, input, offset + 3, offset + 4, offset + 5)
+
+                case _:
+                    raise NotImplemented()
+
+            offset += len(node_channel.channels)
+
+    def translation(self, mocap: bvh.Bvh, input, x: int, y: int, z: int):
+        output = (ctypes.c_float * (mocap.nframes * 3))()
+        for i, f in enumerate(mocap.frames):
+            output[i * 3 + x] = float(f[0]) * self.scale
+            output[i * 3 + y] = float(f[1]) * self.scale
+            output[i * 3 + z] = float(f[2]) * self.scale
+        gltf_sampler: GltfAnimationSampler = {
+            "input": self.bin.push_float_array(1, memoryview(input).tobytes()),
+            "interpolation": "LINEAR",
+            "output": self.bin.push_float_array(3, memoryview(output).tobytes()),
+        }
+        gltf_channel: GltfAnimationChannel = {
+            "sampler": 0,
+            "target": {
+                "node": 1,
+                "path": "translation",
+            },
+        }
+        self.gltf_animation["samplers"].append(gltf_sampler)
+        self.gltf_animation["channels"].append(gltf_channel)
+
+    def rotation_zxy(self, mocap: bvh.Bvh, input, z: int, x: int, y: int):
+        pass
 
 
 def convert(src: pathlib.Path, dst: pathlib.Path, scale: float):
@@ -421,13 +471,16 @@ def convert(src: pathlib.Path, dst: pathlib.Path, scale: float):
         "buffers": [],
         "bufferViews": [],
     }
-    build_hierarchy(nodes, root, bvh_root, scale)
+    bvh_builder = BvhBuilder(nodes)
+    bvh_builder.build_hierarchy(root, bvh_root, scale)
     print_gltf(gltf["nodes"], 0)
 
     # animation
     bin = BinWriter()
-    animation = bvh_animation(mocap, bin, scale)
-    gltf["animations"].append(animation)
+    animation = BvhAnimation(bin, scale)
+    animation.bvh_animation(mocap, bvh_builder.bvh_channels)
+    # animation = bvh_animation(mocap, bin, scale)
+    gltf["animations"].append(animation.gltf_animation)
     gltf["buffers"].append(bin.to_base64())
     gltf["bufferViews"] += bin.views
     gltf["accessors"] += bin.accessors
