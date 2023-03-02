@@ -580,7 +580,16 @@ def convert(src: pathlib.Path, dst: pathlib.Path, scale: float):
 
     bb = GetBB(gltf)
     bb.traverse()
-    bb.print(map[HumanBones.Hips])
+    hips_index = map[HumanBones.Hips]
+    bb.print(hips_index)
+    hips = bb.world_pos[hips_index]
+    delta_y = hips.y - bb.min.y
+
+    # ヒエラルキーを接地させるために hips を移動する
+    print(f"mv {delta_y}")
+    pos = gltf["nodes"][hips_index]["translation"]
+    gltf["nodes"][hips_index]["translation"] = (pos[0], pos[1] + delta_y, pos[2])
+
     # get_bb(gltf)
     dst.write_text(json.dumps(gltf), encoding="utf-8")
 
